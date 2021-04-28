@@ -48,6 +48,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/vmmeter.h>
+#include <sys/malloc.h>
 
 #include <machine/fpu.h>
 #include <machine/efi.h>
@@ -96,8 +97,16 @@ static int efi_status2err[25] = {
 	EPROTO		/* EFI_PROTOCOL_ERROR */
 };
 
+#define ESRT_UUID_LEN 36
+
+static struct esrt_ctx {
+	struct sysctl_ctx_list clist;
+	char uuid_name[ESRT_UUID_LEN + 1];
+} esrt_ctx;
+
 static int efi_enter(void);
 static void efi_leave(void);
+static void represent_esrt_table(struct esrt_ctx *ctx);
 
 int
 efi_status_to_errno(efi_status status)
@@ -155,9 +164,10 @@ efi_init(void)
 	struct efi_rt *rtdm;
 	caddr_t kmdp;
 	size_t efisz;
-	int ndesc, rt_disabled;
+	int ndesc, rt_disabled, esrt_disabled;
 
 	rt_disabled = 0;
+	esrt_disabled = 0;
 	TUNABLE_INT_FETCH("efi.rt.disabled", &rt_disabled);
 	if (rt_disabled == 1)
 		return (0);
@@ -241,6 +251,11 @@ efi_init(void)
 	efi_shutdown_tag = EVENTHANDLER_REGISTER(shutdown_final,
 	    efi_shutdown_final, NULL, SHUTDOWN_PRI_LAST - 1);
 
+	TUNABLE_INT_FETCH("efi.esrt.disabled", &esrt_disabled);
+	if (esrt_disabled == 0) {
+		represent_esrt_table(&esrt_ctx);
+	}
+
 	return (0);
 }
 
@@ -258,6 +273,8 @@ efi_uninit(void)
 	efi_systbl = NULL;
 	efi_cfgtbl = NULL;
 	efi_runtime = NULL;
+
+	sysctl_ctx_free(&esrt_ctx.clist);
 
 	mtx_destroy(&efi_lock);
 }
@@ -335,6 +352,122 @@ get_table(struct uuid *uuid, void **ptr)
 	efi_leave();
 	return (ENOENT);
 }
+
+static void
+represent_esrt_table(struct esrt_ctx *ctx)
+{
+	struct uuid esrt_uuid = EFI_TABLE_ESRT;
+    struct sysctl_oid *root;
+
+	struct esrt_entry_v1 {
+		struct uuid	fw_class;
+		uint32_t 	fw_type;
+		uint32_t	fw_version;
+		uint32_t	lowest_supported_fw_version;
+		uint32_t	capsule_flags;
+		uint32_t	last_attempt_version;
+		uint32_t	last_attempt_status;
+	};
+
+	struct esrt_table {
+		uint32_t	fw_resource_count;
+		uint32_t	fw_resource_count_max;
+		uint64_t	fw_resource_version;
+		uint8_t		entries[];
+	};
+
+	struct esrt_table *esrt_ptr = NULL;
+	struct esrt_entry_v1 *entries_v1;
+	void *ptr = NULL;
+
+	if (efi_get_table(&esrt_uuid, &ptr) != 0) {
+		return;
+	}
+
+	esrt_ptr = (struct esrt_table *) efi_phys_to_kva((uintptr_t) ptr);
+
+	/* check for fw_resource_version, must be 1 */
+	if (!esrt_ptr || esrt_ptr->fw_resource_version != 1) {
+		return;
+	}
+
+	sysctl_ctx_init(&ctx->clist);
+
+	root = SYSCTL_ADD_NODE(&ctx->clist, SYSCTL_STATIC_CHILDREN(_hw_efi),
+			OID_AUTO, "esrt", CTLFLAG_RD, NULL, "ESRT table");
+
+	if (root == NULL) {
+		printf("%s: unable to allocate sysctl tree\n", __func__);
+		return;
+	}
+
+	SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(root), OID_AUTO,
+			"fw_resource_count", CTLFLAG_RD,
+			&esrt_ptr->fw_resource_count, 0,
+			"The number of firmware resources in the table");
+	SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(root), OID_AUTO,
+			"fw_resource_count_max", CTLFLAG_RD,
+			&esrt_ptr->fw_resource_count_max, 0, "");
+	SYSCTL_ADD_U64(&ctx->clist, SYSCTL_CHILDREN(root), OID_AUTO,
+			"fw_resource_version", CTLFLAG_RD,
+			&esrt_ptr->fw_resource_version, 0,
+			"The version of the ESRT entities");
+
+	entries_v1 = (void *) esrt_ptr->entries;
+
+	for (uint32_t i = 0; i < esrt_ptr->fw_resource_count; i++) {
+
+		struct esrt_entry_v1 *e = &entries_v1[i];
+		struct sysctl_oid *oid;
+		int n, num_dec;
+		char *entry_name;
+
+		/* Count the number of decimal digits */
+		for (n = 0, num_dec = i; num_dec != 0; n++)
+			num_dec /= 10;
+		entry_name = malloc(strlen("entry") + n + 1, M_TEMP, M_ZERO | M_WAITOK);
+		if (!entry_name) {
+			printf("%s: unable to allocate entry name\n", __func__);
+			return;
+		}
+		sprintf(entry_name, "%s%d", "entry", i);
+
+		oid = SYSCTL_ADD_NODE(&ctx->clist, SYSCTL_CHILDREN(root), OID_AUTO,
+				entry_name, CTLFLAG_RD, NULL, "");
+		if (oid == NULL) {
+			printf("%s: unable to allocate sysctl tree\n", __func__);
+			return;
+		}
+
+		snprintf_uuid(ctx->uuid_name, ESRT_UUID_LEN + 1, &e->fw_class);
+
+		SYSCTL_ADD_CONST_STRING(&ctx->clist, SYSCTL_CHILDREN(oid), OID_AUTO,
+				"fw_class", CTLFLAG_RD, ctx->uuid_name,
+				"GUID that identifies a firmware component");
+		SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(oid), OID_AUTO,
+				"fw_type", CTLFLAG_RD, &e->fw_type, 0,
+				"Type of firmware resource");
+		SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(oid), OID_AUTO,
+				"fw_version", CTLFLAG_RD, &e->fw_version, 0,
+				"The current version of the firmware resource");
+		SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(oid), OID_AUTO,
+				"lowest_supported_fw_version", CTLFLAG_RD,
+				&e->lowest_supported_fw_version, 0,
+				"The lowest firmware resource version to which a firmware");
+		SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(oid), OID_AUTO,
+				"capsule_flags", CTLFLAG_RD, &e->capsule_flags, 0,
+				"The capsule flags field in decimal");
+		SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(oid), OID_AUTO,
+				"last_attempt_version", CTLFLAG_RD, &e->last_attempt_version, 0,
+				"The last firmware version for which an update was attempted");
+		SYSCTL_ADD_U32(&ctx->clist, SYSCTL_CHILDREN(oid), OID_AUTO,
+				"last_attempt_status", CTLFLAG_RD, &e->last_attempt_status, 0,
+				"The result of the last firmware update attempt");
+
+		free(entry_name, M_TEMP);
+	}
+}
+
 
 static int efi_rt_handle_faults = EFI_RT_HANDLE_FAULTS_DEFAULT;
 SYSCTL_INT(_machdep, OID_AUTO, efi_rt_handle_faults, CTLFLAG_RWTUN,
