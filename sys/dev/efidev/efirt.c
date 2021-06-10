@@ -34,11 +34,13 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/efi.h>
+#include <sys/uio.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/linker.h>
 #include <sys/lock.h>
 #include <sys/module.h>
+#include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/clock.h>
 #include <sys/proc.h>
@@ -57,6 +59,9 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm.h>
 #include <vm/pmap.h>
 #include <vm/vm_map.h>
+#include <vm/vm_page.h>
+
+#define ARRAY_LENGTH(a) (sizeof(a) / sizeof((a)[0]))
 
 static struct efi_systbl *efi_systbl;
 static eventhandler_tag efi_shutdown_tag;
@@ -94,6 +99,11 @@ static int efi_status2err[25] = {
 	EPROTO,		/* EFI_ICMP_ERROR */
 	EPROTO,		/* EFI_TFTP_ERROR */
 	EPROTO		/* EFI_PROTOCOL_ERROR */
+};
+
+enum efi_table_type {
+	TYPE_ESRT = 0,
+	TYPE_PROP
 };
 
 static int efi_enter(void);
@@ -336,6 +346,136 @@ get_table(struct uuid *uuid, void **ptr)
 	return (ENOENT);
 }
 
+static int
+get_table_length(enum efi_table_type type, size_t *table_len, void **taddr)
+{
+	switch (type) {
+	case TYPE_ESRT:
+		{
+			struct efi_esrt_table *esrt = NULL;
+			struct uuid uuid = EFI_TABLE_ESRT;
+			size_t len = sizeof(*esrt);
+			uint32_t fw_resource_count = 0;
+			int error;
+//			void *buf = malloc(len, M_TEMP, M_WAITOK);
+
+			error = efi_get_table(&uuid, (void **)&esrt);
+			if (error != 0) {
+//				free(buf, M_TEMP);
+				break;
+			}
+#if 1
+			efi_enter();
+			fw_resource_count = esrt->fw_resource_count;
+			efi_leave();
+#endif
+#if 0
+            printf("%s: esrt:%p, buf=%p, len=%zu\n", __func__, esrt, buf, len);
+            error = physcopyout((vm_paddr_t)esrt, buf, len);
+			if (error != 0) {
+				free(buf, M_TEMP);
+				break;
+			}
+			fw_resource_count = ((struct efi_esrt_table *)buf)->fw_resource_count;
+			/* TODO check esrt version */
+            if (fw_resource_count != 1) {
+                printf("%s fw_resource_count: %u\n", __func__, fw_resource_count);
+                return (ENXIO);
+            }
+#endif
+			len += sizeof(struct efi_esrt_entry_v1) * fw_resource_count;
+			*table_len = len;
+			printf("%s taddr = %p\n", __func__, esrt);
+			printf("%s fw_resource_count: %u\n", __func__, fw_resource_count);
+			printf("%s got esrt table len: %zu\n", __func__, *table_len);
+			if (taddr != NULL) {
+				*taddr = esrt;
+			}
+//			free(buf, M_TEMP);
+			return (0);
+		}
+	case TYPE_PROP:
+		{
+			struct uuid uuid = EFI_PROPERTIES_TABLE;
+			struct efi_prop_table *prop;
+			size_t len;
+			int error;
+
+			error = efi_get_table(&uuid, (void **)&prop);
+			if (error != 0) {
+				break;
+			}
+
+			efi_enter();
+			len = prop->length;
+			efi_leave();
+
+			*table_len = len;
+			printf("%s taddr = %p\n", __func__, prop);
+			printf("%s got prop table len: %zu\n", __func__, *table_len);
+			if (taddr != NULL) {
+				*taddr = prop;
+			}
+			return (0);
+		}
+	}
+	return (ENOENT);
+}
+
+static int
+copy_table(struct uuid *uuid, void **buf, size_t buf_len, size_t *table_len)
+{
+	struct known_table {
+		struct uuid uuid;
+		enum efi_table_type type;
+	};
+
+	struct known_table tables[] = {
+		{ EFI_TABLE_ESRT,       TYPE_ESRT },
+		{ EFI_PROPERTIES_TABLE, TYPE_PROP }
+	};
+	bool table_supported = false;
+	size_t table_idx;
+	void *taddr;
+    int rc;
+
+	for (table_idx = 0; table_idx < ARRAY_LENGTH(tables); table_idx++) {
+		if (!bcmp(&tables[table_idx].uuid, uuid, sizeof(*uuid))) {
+			table_supported = true;
+			break;
+		}
+	}
+
+	if (!table_supported) {
+		return (EINVAL);
+	}
+
+	rc = get_table_length(tables[table_idx].type, table_len, &taddr);
+    if (rc != 0) {
+        return rc;
+    }
+	printf("%s: buf addr: %p\n", __func__, (buf) ? *buf : NULL);
+
+	/* return table length to userspace */
+	if (buf == NULL) {
+		printf("%s: only get length\n", __func__);
+		return (0);
+	}
+	printf("%s: get table\n", __func__);
+
+	*buf = malloc(*table_len, M_TEMP, M_WAITOK);
+	if (*buf == NULL) {
+		return (ENOMEM);
+	}
+	printf("%s taddr = %p\n", __func__, taddr);
+
+	efi_enter();
+	memcpy(*buf, taddr, *table_len);
+	efi_leave();
+
+	return (0);
+}
+
 static int efi_rt_handle_faults = EFI_RT_HANDLE_FAULTS_DEFAULT;
 SYSCTL_INT(_machdep, OID_AUTO, efi_rt_handle_faults, CTLFLAG_RWTUN,
     &efi_rt_handle_faults, 0,
@@ -568,6 +708,7 @@ var_set(efi_char *name, struct uuid *vendor, uint32_t attrib,
 const static struct efi_ops efi_ops = {
 	.rt_ok = rt_ok,
 	.get_table = get_table,
+	.copy_table = copy_table,
 	.get_time = get_time,
 	.get_time_capabilities = get_time_capabilities,
 	.reset_system = reset_system,
